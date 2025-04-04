@@ -1,10 +1,16 @@
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
+
+// Thread-local buffer to reuse across saves
+thread_local! {
+    static SERIALIZE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(1024 * 64)); // 64 KB buffer
+}
 
 /// JsonMutexDB provides thread-safe access to a JSON file acting as a simple database.
 /// It supports asynchronous (batched) updates and fast serialization (using simd-json)
@@ -123,17 +129,36 @@ impl JsonMutexDB {
     /// The JSON is saved in either pretty printed or compact format based on configuration.
     pub fn save_sync(&self) -> Result<(), IoError> {
         let data_guard = self.data.lock();
+        let json_data = &*data_guard;
+
         let content = if self.pretty {
-            serde_json::to_string_pretty(&*data_guard)
-                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))
+            // Use pretty printing via serde_json (fallback)
+            serde_json::to_string_pretty(json_data)
+                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?
         } else if self.fast_serialization {
-            // Use simd-json for fast compact serialization.
-            simd_json::to_string(&*data_guard)
-                .map_err(|e| IoError::new(ErrorKind::Other, format!("simd_json error: {:?}", e)))
+            // Use fast compact serialization with a preallocated buffer.
+            SERIALIZE_BUF.with(|buf_cell| {
+                let mut buf = buf_cell.borrow_mut();
+                // Clear the buffer but keep its capacity
+                buf.clear();
+                // Here we use simd-json's fast serialization method if available.
+                // For demonstration, we'll use serde_json's to_vec and then convert to String.
+                // In practice, you might have a more direct API that writes into buf.
+                let vec = simd_json::to_vec(json_data).map_err(|e| {
+                    IoError::new(ErrorKind::Other, format!("simd_json error: {:?}", e))
+                })?;
+                // Ensure our buffer is large enough and copy the data into it.
+                buf.extend_from_slice(&vec);
+                // Convert the pre-allocated buffer into a String.
+                // Since the output is valid UTF-8, this is safe.
+                String::from_utf8(buf.clone())
+                    .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))
+            })?
         } else {
-            serde_json::to_string(&*data_guard)
-                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))
-        }?;
+            // Default compact serialization via serde_json.
+            serde_json::to_string(json_data)
+                .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?
+        };
         fs::write(&self.path, content)
     }
 
