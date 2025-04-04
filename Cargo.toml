@@ -3,6 +3,8 @@ name = "json-mutex-db"
 version = "0.0.1"
 edition = "2024"
 authors = [ "Georgii Plotnikov<georgii@inferara.com>" ]
+description = "Ridiculously simple, fast and thread safe JSON file database"
+license = "Apache-2.0"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
