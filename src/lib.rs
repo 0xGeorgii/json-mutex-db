@@ -321,13 +321,13 @@ impl JsonMutexDB {
             let mut buffered_writer = BufWriter::new(writer);
             if pretty {
                 serde_json::to_writer_pretty(&mut buffered_writer, data_to_save)
-                    .map_err(|e| DbError::Io(IoError::new(ErrorKind::Other, e.to_string())))?;
+                    .map_err(|e| DbError::Io(IoError::other(e.to_string())))?;
             } else if fast_serialization {
                 simd_json::to_writer(&mut buffered_writer, data_to_save)
-                    .map_err(|e| DbError::Io(IoError::new(ErrorKind::Other, format!("{e:?}"))))?;
+                    .map_err(|e| DbError::Io(IoError::other(format!("{e:?}"))))?;
             } else {
                 serde_json::to_writer(&mut buffered_writer, data_to_save)
-                    .map_err(|e| DbError::Io(IoError::new(ErrorKind::Other, e.to_string())))?;
+                    .map_err(|e| DbError::Io(IoError::other(e.to_string())))?;
             }
             buffered_writer.flush()?; // Ensure buffer is flushed
             Ok(())
@@ -352,10 +352,10 @@ impl JsonMutexDB {
 
             // Persist atomically (consumes temp_file)
             temp_file.persist(&final_path).map_err(|e| {
-                DbError::Io(IoError::new(
-                    ErrorKind::Other,
-                    format!("Failed to atomically rename temp file: {}", e.error),
-                ))
+                DbError::Io(IoError::other(format!(
+                    "Failed to atomically rename temp file: {}",
+                    e.error
+                )))
             })?;
         } else {
             // Non-atomic: Create/truncate target file directly
