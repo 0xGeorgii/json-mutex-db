@@ -1,14 +1,18 @@
+use parking_lot::Mutex;
 use serde_json::Value;
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
-use std::sync::Mutex;
+use std::thread;
 
 /// JsonMutexDB provides thread-safe access to a JSON file acting as a simple database.
+/// It can operate in either “pretty” mode (human-readable) or “compact” mode for speed.
 pub struct JsonMutexDB {
-    /// A Mutex protecting the in-memory JSON data.
+    /// A lightweight Mutex protecting the in-memory JSON data.
     data: Mutex<Value>,
     /// The path to the JSON file on disk.
     path: String,
+    /// Whether to pretty-print when saving.
+    pretty: bool,
 }
 
 impl JsonMutexDB {
@@ -16,17 +20,11 @@ impl JsonMutexDB {
     ///
     /// If the file at `path` exists and contains valid JSON, it will be loaded.
     /// Otherwise, an empty JSON object is created and used.
-    pub fn new(path: &str) -> Result<Self, IoError> {
+    /// The `pretty` flag indicates whether to pretty print when saving (true) or use a compact format (false).
+    pub fn new(path: &str, pretty: bool) -> Result<Self, IoError> {
         let json = match fs::read_to_string(path) {
-            Ok(content) => {
-                match serde_json::from_str::<Value>(&content) {
-                    Ok(val) => val,
-                    Err(_) => {
-                        // If JSON is invalid, return an error.
-                        return Err(IoError::new(ErrorKind::InvalidData, "Invalid JSON content"));
-                    }
-                }
-            }
+            Ok(content) => serde_json::from_str::<Value>(&content)
+                .map_err(|_| IoError::new(ErrorKind::InvalidData, "Invalid JSON content"))?,
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 // File doesn't exist: start with an empty JSON object.
                 Value::Object(serde_json::Map::new())
@@ -37,18 +35,19 @@ impl JsonMutexDB {
         Ok(JsonMutexDB {
             data: Mutex::new(json),
             path: path.to_string(),
+            pretty,
         })
     }
 
     /// Returns a clone of the in-memory JSON data.
     pub fn get(&self) -> Value {
-        let data_guard = self.data.lock().expect("Mutex poisoned");
+        let data_guard = self.data.lock();
         data_guard.clone()
     }
 
     /// Replaces the in-memory JSON data with `new_data`.
     pub fn set(&self, new_data: Value) {
-        let mut data_guard = self.data.lock().expect("Mutex poisoned");
+        let mut data_guard = self.data.lock();
         *data_guard = new_data;
     }
 
@@ -59,18 +58,47 @@ impl JsonMutexDB {
     where
         F: FnOnce(&mut Value),
     {
-        let mut data_guard = self.data.lock().expect("Mutex poisoned");
+        let mut data_guard = self.data.lock();
         update_fn(&mut data_guard);
     }
 
-    /// Saves the current in-memory JSON data to the file on disk.
+    /// Synchronously saves the current in-memory JSON data to the file on disk.
     ///
-    /// The JSON is saved in a pretty printed format.
-    pub fn save(&self) -> Result<(), IoError> {
-        let data_guard = self.data.lock().expect("Mutex poisoned");
-        let content = serde_json::to_string_pretty(&*data_guard)
-            .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
+    /// The JSON is saved in either pretty printed or compact format based on configuration.
+    pub fn save_sync(&self) -> Result<(), IoError> {
+        let data_guard = self.data.lock();
+        let content = if self.pretty {
+            serde_json::to_string_pretty(&*data_guard)
+        } else {
+            serde_json::to_string(&*data_guard)
+        }
+        .map_err(|e| IoError::new(ErrorKind::Other, e.to_string()))?;
         fs::write(&self.path, content)
+    }
+
+    /// Asynchronously saves the current in-memory JSON data.
+    ///
+    /// This spawns a background thread so that the calling thread is not blocked by I/O or serialization.
+    /// Note: Any errors in the background thread are printed to stderr.
+    pub fn save_async(&self) {
+        let data = self.get(); // grab a snapshot of the current data
+        let path = self.path.clone();
+        let pretty = self.pretty;
+        thread::spawn(move || {
+            let result = if pretty {
+                serde_json::to_string_pretty(&data)
+            } else {
+                serde_json::to_string(&data)
+            };
+            match result {
+                Ok(content) => {
+                    if let Err(e) = fs::write(&path, content) {
+                        eprintln!("Async save failed: {}", e);
+                    }
+                }
+                Err(e) => eprintln!("Serialization error in async save: {}", e),
+            }
+        });
     }
 }
 
@@ -89,7 +117,7 @@ mod tests {
         let _ = fs::remove_file(tmp_path);
 
         // Create a new DB instance (file not found, so should initialize with empty object)
-        let db = JsonMutexDB::new(tmp_path).expect("Failed to create JsonMutexDB");
+        let db = JsonMutexDB::new(tmp_path, false).expect("Failed to create JsonMutexDB");
         let data = db.get();
         assert_eq!(data, json!({}));
 
@@ -97,19 +125,19 @@ mod tests {
     }
 
     #[test]
-    fn test_jsonmutexdb_set_and_save() {
+    fn test_jsonmutexdb_set_and_save_sync() {
         let tmp_path = "test_db_set_save.json";
         let _ = fs::remove_file(tmp_path);
 
-        let db = JsonMutexDB::new(tmp_path).expect("Failed to create JsonMutexDB");
+        let db = JsonMutexDB::new(tmp_path, false).expect("Failed to create JsonMutexDB");
 
-        // Set new data and save
+        // Set new data and save synchronously using the compact mode.
         let new_data = json!({
             "key": "value",
             "numbers": [1, 2, 3]
         });
         db.set(new_data.clone());
-        db.save().expect("Failed to save JSON data");
+        db.save_sync().expect("Failed to save JSON data");
 
         // Read file back and compare
         let file_content = fs::read_to_string(tmp_path).expect("Failed to read file");
@@ -123,14 +151,14 @@ mod tests {
     fn test_pretty_print_format() {
         let tmp_path = "test_db_format.json";
         let _ = fs::remove_file(tmp_path);
-        let db = JsonMutexDB::new(tmp_path).unwrap();
+        let db = JsonMutexDB::new(tmp_path, true).unwrap();
         let new_data = json!({
             "name": "Test",
             "value": 123,
-            "array": [1,2,3]
+            "array": [1, 2, 3]
         });
         db.set(new_data);
-        db.save().unwrap();
+        db.save_sync().unwrap();
         let file_content = fs::read_to_string(tmp_path).unwrap();
         // Verify that the JSON is pretty printed (contains newlines)
         assert!(
@@ -146,7 +174,7 @@ mod tests {
         let tmp_path = "test_db_multithread.json";
         let _ = fs::remove_file(tmp_path);
 
-        let db = Arc::new(JsonMutexDB::new(tmp_path).unwrap());
+        let db = Arc::new(JsonMutexDB::new(tmp_path, false).unwrap());
         let num_threads = 10;
         let updates_per_thread = 100;
         let mut handles = vec![];
@@ -176,14 +204,12 @@ mod tests {
         let _ = fs::remove_file(tmp_path);
     }
 
-    /// Benchmark saving the database with pretty printed JSON.
-    /// This test is marked #[ignore] so that it doesn't run by default.
     #[test]
-    #[ignore]
-    fn benchmark_save_pretty_print() {
+    fn benchmark_save_compact() {
         let tmp_path = "test_db_perf.json";
         let _ = fs::remove_file(tmp_path);
-        let db = JsonMutexDB::new(tmp_path).unwrap();
+        // Use compact mode (fast mode)
+        let db = JsonMutexDB::new(tmp_path, false).unwrap();
 
         // Create a large JSON object with 1000 key-value pairs.
         let mut large_obj = serde_json::Map::new();
@@ -195,27 +221,31 @@ mod tests {
         let iterations = 100;
         let start = Instant::now();
         for _ in 0..iterations {
-            db.save().unwrap();
+            db.save_sync().expect("Save failed");
         }
         let elapsed = start.elapsed();
-        println!("Elapsed time for {} saves: {:?}", iterations, elapsed);
+        println!(
+            "Elapsed time for {} compact saves: {:?}",
+            iterations, elapsed
+        );
         let avg = elapsed.as_secs_f64() / iterations as f64;
-        println!("Average time per save: {} seconds", avg);
-        // Threshold: average save time should be less than 0.01 seconds.
-        assert!(avg < 0.01, "Average save time too slow: {} seconds", avg);
+        println!("Average time per compact save: {} seconds", avg);
+        // Expect a dramatic speed-up relative to pretty printing.
+        assert!(
+            avg < 0.00001,
+            "Average compact save time too slow: {} seconds",
+            avg
+        );
 
         let _ = fs::remove_file(tmp_path);
     }
 
-    /// Benchmark multithreaded updates.
-    /// This test is marked #[ignore] so that it doesn't run by default.
     #[test]
-    #[ignore]
-    fn benchmark_multithread_update() {
+    fn benchmark_multithread_update_fast() {
         let tmp_path = "test_db_multithread_perf.json";
         let _ = fs::remove_file(tmp_path);
 
-        let db = Arc::new(JsonMutexDB::new(tmp_path).unwrap());
+        let db = Arc::new(JsonMutexDB::new(tmp_path, false).unwrap());
         let num_threads = 10;
         let updates_per_thread = 1000;
         let start = Instant::now();
@@ -239,10 +269,13 @@ mod tests {
         }
 
         let elapsed = start.elapsed();
-        println!("Elapsed time for multithread update: {:?}", elapsed);
-        // Threshold: total update time should be less than 1 second.
+        println!(
+            "Elapsed time for multithread update (fast mode): {:?}",
+            elapsed
+        );
+        // In compact mode with parking_lot, we expect very fast updates.
         assert!(
-            elapsed.as_secs_f64() < 1.0,
+            elapsed.as_secs_f64() < 0.001,
             "Multithread update took too long: {:?}",
             elapsed
         );
