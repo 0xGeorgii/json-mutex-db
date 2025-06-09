@@ -1,15 +1,19 @@
+#![doc = include_str!("../README.md")]
 #![warn(clippy::pedantic)]
 use serde_json::Value;
 use std::cell::RefCell;
 use std::fs::{self, File};
 use std::io::{Error as IoError, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use tempfile::NamedTempFile;
 
+use crossbeam_channel::{Sender, unbounded};
 use parking_lot::RwLock;
-use crossbeam_channel::{unbounded, Sender, Receiver};
 
 // Error type for operations that might fail due to background thread issues
 #[derive(Debug)]
@@ -36,25 +40,26 @@ impl From<IoError> for DbError {
     }
 }
 
-
-// Thread-local buffer (optional, kept from previous version)
 thread_local! {
     static SERIALIZE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(1024 * 64));
 }
 
+#[cfg(test)]
+#[must_use]
+pub fn test_buf_capacity() -> usize {
+    SERIALIZE_BUF.with(|cell| cell.borrow().capacity())
+}
+
 pub struct JsonMutexDB {
     path: PathBuf,
-    parent_dir: PathBuf,
     pretty: bool,
     fast_serialization: bool,
     inner: Arc<RwLock<Value>>,
     save_sched: Option<Sender<()>>,
     save_handle: Option<thread::JoinHandle<()>>,
-    /// Flag indicating if a save signal is pending in the background thread
     save_pending: Option<Arc<AtomicBool>>,
     dirty: AtomicBool,
 }
-
 
 // Implement UnwindSafe and RefUnwindSafe manually for JsonMutexDB
 impl std::panic::UnwindSafe for JsonMutexDB {}
@@ -88,15 +93,12 @@ impl JsonMutexDB {
             Err(err) => return Err(DbError::Io(err)),
         };
 
-        // Prepare file path and ensure parent directory exists
         let path_buf = PathBuf::from(path);
         let parent_dir = path_buf
             .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::new());
+            .map_or_else(PathBuf::new, Path::to_path_buf);
         fs::create_dir_all(&parent_dir)?;
 
-        // Pre-allocate serialization buffer based on existing file size to minimize reallocations
         if let Ok(size) = fs::metadata(path).map(|m| m.len() as usize) {
             SERIALIZE_BUF.with(|cell| {
                 let mut buf = cell.borrow_mut();
@@ -121,29 +123,21 @@ impl JsonMutexDB {
             let pending_thread = Arc::clone(&pending_cl);
             // Background thread: coalesce save signals and final shutdown save
             let handle = thread::spawn(move || {
-                for _ in rx {
+                for () in rx {
                     // Mark pending cleared before processing
                     pending_thread.store(false, Ordering::SeqCst);
-                    let data = inner_cl.read().clone();
-                    if let Err(e) = JsonMutexDB::save_data_to_disk(
-                        &path_cl,
-                        &data,
-                        pretty_cl,
-                        fast_cl,
-                        true,
-                    ) {
+                    let guard = inner_cl.read();
+                    if let Err(e) =
+                        JsonMutexDB::save_data_to_disk(&path_cl, &guard, pretty_cl, fast_cl, true)
+                    {
                         eprintln!("Async background save failed: {e:?}");
                     }
                 }
                 // Final non-atomic save on shutdown
-                let data = inner_cl.read().clone();
-                if let Err(e) = JsonMutexDB::save_data_to_disk(
-                    &path_cl,
-                    &data,
-                    pretty_cl,
-                    fast_cl,
-                    false,
-                ) {
+                let guard = inner_cl.read();
+                if let Err(e) =
+                    JsonMutexDB::save_data_to_disk(&path_cl, &guard, pretty_cl, fast_cl, false)
+                {
                     eprintln!("Error during final background save: {e:?}");
                 }
             });
@@ -157,7 +151,6 @@ impl JsonMutexDB {
 
         Ok(JsonMutexDB {
             path: path_buf,
-            parent_dir,
             pretty,
             fast_serialization,
             inner,
@@ -204,7 +197,7 @@ impl JsonMutexDB {
         // Apply update immediately to in-memory state
         {
             let mut guard = self.inner.write();
-            update_fn(&mut *guard);
+            update_fn(&mut guard);
         }
         self.dirty.store(true, Ordering::Release);
         // Signal background save thread if enabled, coalescing multiple signals
@@ -237,7 +230,7 @@ impl JsonMutexDB {
         let guard = self.inner.read();
         let result = Self::save_data_to_disk(
             &self.path,
-            &*guard,
+            &guard,
             self.pretty,
             self.fast_serialization,
             true,
@@ -270,13 +263,9 @@ impl JsonMutexDB {
 
         thread::spawn(move || {
             let guard = inner_clone.read();
-            if let Err(e) = Self::save_data_to_disk(
-                &path_clone,
-                &*guard,
-                pretty_clone,
-                fast_serial_clone,
-                true,
-            ) {
+            if let Err(e) =
+                Self::save_data_to_disk(&path_clone, &guard, pretty_clone, fast_serial_clone, true)
+            {
                 eprintln!("Async save failed: {e:?}");
             }
         });
@@ -687,11 +676,8 @@ mod tests {
         }
     }
 
-    // Test marked ignore because the interaction between main state and async state
-    // in this simple implementation makes reliable testing difficult without
-    // more complex synchronization/query mechanisms.
+    /// Basic async updates propagation and file persistence test
     #[test]
-    #[ignore]
     fn test_async_updates_basic_propagation() {
         let tmp_path = "test_db_async_prop.json";
         cleanup_file(tmp_path);
@@ -763,10 +749,9 @@ mod tests {
         cleanup_file(tmp_path);
     }
 
-    // --- Performance Benchmarks (Ignored by default) ---
+    // --- Performance Profiling (prints metrics, no pass/fail thresholds) ---
 
     #[test]
-    #[ignore] // Performance sensitive, run explicitly
     #[allow(clippy::cast_sign_loss)]
     fn benchmark_save_sync_compact_fast_optimized() {
         let tmp_path = "test_db_perf_save_sync_fast.json";
@@ -793,11 +778,6 @@ mod tests {
         );
         let avg_micros = elapsed.as_micros() / iterations as u128;
         println!("[Optimized] Average time per save: {avg_micros} microseconds");
-        // Adjust assertion based on expected performance on target machine
-        assert!(
-            avg_micros < 500,
-            "Average save time too slow: {avg_micros} micros"
-        );
 
         cleanup_file(tmp_path);
     }
@@ -805,7 +785,6 @@ mod tests {
     // Benchmark for async updates (measures enqueue/processing time)
     // Still potentially ignores final persistence time.
     #[test]
-    #[ignore]
     fn benchmark_multithread_update_async_optimized() {
         let tmp_path = "test_db_perf_async_update.json";
         cleanup_file(tmp_path);
@@ -922,7 +901,12 @@ mod tests {
     }
 
     /// Naive JSON write helper (before optimization)
-    fn write_json_orig<W: Write>(writer: &mut W, data: &Value, pretty: bool, fast: bool) -> std::io::Result<()> {
+    fn write_json_orig<W: Write>(
+        writer: &mut W,
+        data: &Value,
+        pretty: bool,
+        fast: bool,
+    ) -> std::io::Result<()> {
         if pretty {
             serde_json::to_writer_pretty(writer.by_ref(), data)?;
         } else if fast {
@@ -938,7 +922,7 @@ mod tests {
     fn test_write_call_count_compact_fast() {
         let mut data_map = serde_json::Map::new();
         for i in 0..500 {
-            data_map.insert(format!("key{}", i), json!(i));
+            data_map.insert(format!("key{i}"), json!(i));
         }
         let v = Value::Object(data_map);
         let mut cnt_std = WriteCounter::new();
@@ -949,9 +933,7 @@ mod tests {
         let fast_calls = cnt_fast.calls();
         assert!(
             fast_calls <= std_calls,
-            "fast serialization should use no more write calls: fast={} std={}",
-            fast_calls,
-            std_calls
+            "fast serialization should use no more write calls: fast={fast_calls} std={std_calls}"
         );
     }
 
@@ -969,9 +951,7 @@ mod tests {
         let pretty_calls = cnt_pretty.calls();
         assert!(
             pretty_calls >= compact_calls,
-            "pretty printing should use at least as many write calls: pretty={} compact={}",
-            pretty_calls,
-            compact_calls
+            "pretty printing should use at least as many write calls: pretty={pretty_calls} compact={compact_calls}",
         );
     }
 
@@ -979,7 +959,7 @@ mod tests {
     fn test_optimized_vs_naive_write_calls_standard() {
         let mut data_map = serde_json::Map::new();
         for i in 0..1000 {
-            data_map.insert(format!("key{}", i), json!(i));
+            data_map.insert(format!("key{i}"), json!(i));
         }
         let v = Value::Object(data_map);
         let mut cnt_old = WriteCounter::new();
@@ -990,9 +970,7 @@ mod tests {
         let new_calls = cnt_new.calls();
         assert!(
             new_calls < old_calls,
-            "optimized write_json_raw should use fewer writes than naive: {} < {}",
-            new_calls,
-            old_calls
+            "optimized write_json_raw should use fewer writes than naive: {new_calls} < {old_calls}",
         );
     }
 
@@ -1000,7 +978,7 @@ mod tests {
     fn test_optimized_vs_naive_write_calls_fast() {
         let mut data_map = serde_json::Map::new();
         for i in 0..1000 {
-            data_map.insert(format!("key{}", i), json!(i));
+            data_map.insert(format!("key{i}"), json!(i));
         }
         let v = Value::Object(data_map);
         let mut cnt_old = WriteCounter::new();
@@ -1011,9 +989,7 @@ mod tests {
         let new_calls = cnt_new.calls();
         assert!(
             new_calls < old_calls,
-            "optimized write_json_raw should use fewer writes than naive fast: {} < {}",
-            new_calls,
-            old_calls
+            "optimized write_json_raw should use fewer writes than naive fast: {new_calls} < {old_calls}",
         );
     }
 
@@ -1031,9 +1007,131 @@ mod tests {
         let pretty_calls = cnt_pretty.calls();
         assert!(
             pretty_calls >= compact_calls,
-            "pretty printing should use at least as many write calls: pretty={} compact={}",
-            pretty_calls,
-            compact_calls
+            "pretty printing should use at least as many write calls: pretty={pretty_calls} compact={compact_calls}",
+        );
+    }
+
+    #[test]
+    fn test_buffer_capacity_reuse() {
+        let mut data_map = serde_json::Map::new();
+        for i in 0..100 {
+            data_map.insert(format!("k{i}"), json!(i));
+        }
+        let v = Value::Object(data_map);
+        write_json_raw(&mut WriteCounter::new(), &v, false, true).unwrap();
+        let cap1 = test_buf_capacity();
+        write_json_raw(&mut WriteCounter::new(), &v, false, true).unwrap();
+        let cap2 = test_buf_capacity();
+        assert_eq!(
+            cap1, cap2,
+            "buffer capacity should be reused across serializations"
+        );
+    }
+
+    #[test]
+    fn test_initial_buffer_reservation_based_on_file_size() {
+        let tmp_path = "test_buf_reserve_size.json";
+        cleanup_file(tmp_path);
+        let json_str = format!("\"{}\"", "x".repeat(2000));
+        fs::write(tmp_path, &json_str).unwrap();
+        let _db = JsonMutexDB::new(tmp_path, false, false, false).unwrap();
+        let cap = test_buf_capacity();
+        assert!(
+            cap >= json_str.len() + 1024,
+            "buffer capacity {cap} should be at least file size {file_size} + 1024",
+            cap = cap,
+            file_size = json_str.len()
+        );
+        cleanup_file(tmp_path);
+    }
+
+    /// Tests that optimized JSON serialization writes the same number of bytes as the naive implementation.
+    #[test]
+    fn test_bytes_written_equality_standard() {
+        let mut data_map = serde_json::Map::new();
+        for i in 0..500 {
+            data_map.insert(format!("key{i}"), json!(i));
+        }
+        let v = Value::Object(data_map);
+        let mut cnt_old = WriteCounter::new();
+        write_json_orig(&mut cnt_old, &v, false, false).unwrap();
+        let bytes_old = cnt_old.bytes();
+        let mut cnt_new = WriteCounter::new();
+        write_json_raw(&mut cnt_new, &v, false, false).unwrap();
+        let bytes_new = cnt_new.bytes();
+        assert_eq!(
+            bytes_new, bytes_old,
+            "optimized write should write same bytes as naive: {bytes_new} vs {bytes_new}",
+        );
+    }
+
+    #[test]
+    fn test_bytes_written_equality_fast() {
+        let mut data_map = serde_json::Map::new();
+        for i in 0..500 {
+            data_map.insert(format!("key{i}"), json!(i));
+        }
+        let v = Value::Object(data_map);
+        let mut cnt_old = WriteCounter::new();
+        write_json_orig(&mut cnt_old, &v, false, true).unwrap();
+        let bytes_old = cnt_old.bytes();
+        let mut cnt_new = WriteCounter::new();
+        write_json_raw(&mut cnt_new, &v, false, true).unwrap();
+        let bytes_new = cnt_new.bytes();
+        assert_eq!(
+            bytes_new, bytes_old,
+            "fast optimized write should write same bytes as naive fast: {bytes_new} vs {bytes_old}",
+        );
+    }
+
+    #[test]
+    fn test_bytes_pretty_vs_compact() {
+        let mut data_map = serde_json::Map::new();
+        data_map.insert("a".to_string(), json!(1));
+        data_map.insert("b".to_string(), json!(2));
+        let v = Value::Object(data_map);
+        let mut cnt_compact = WriteCounter::new();
+        write_json_raw(&mut cnt_compact, &v, false, false).unwrap();
+        let bytes_compact = cnt_compact.bytes();
+        let mut cnt_pretty = WriteCounter::new();
+        write_json_raw(&mut cnt_pretty, &v, true, false).unwrap();
+        let bytes_pretty = cnt_pretty.bytes();
+        assert!(
+            bytes_pretty >= bytes_compact,
+            "pretty bytes {bytes_pretty} should be at least compact bytes {bytes_compact}",
+        );
+    }
+
+    #[test]
+    fn test_buffer_growth_and_reuse_for_larger_data() {
+        SERIALIZE_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.shrink_to_fit();
+        });
+        let cap0 = test_buf_capacity();
+        assert_eq!(
+            cap0, 0,
+            "initial buffer should have zero capacity after shrink_to_fit"
+        );
+
+        let mut large_map = serde_json::Map::new();
+        for i in 0..2000 {
+            large_map.insert(format!("k{i}"), json!(i));
+        }
+        let v = Value::Object(large_map);
+        write_json_raw(&mut WriteCounter::new(), &v, false, true).unwrap();
+        let cap1 = test_buf_capacity();
+        assert!(
+            cap1 >= 2000 * 4,
+            "buffer capacity {cap1} should grow to accommodate large data",
+        );
+
+        write_json_raw(&mut WriteCounter::new(), &v, false, true).unwrap();
+        let cap2 = test_buf_capacity();
+        assert_eq!(
+            cap1, cap2,
+            "buffer capacity should be reused after serializing larger data"
         );
     }
 }

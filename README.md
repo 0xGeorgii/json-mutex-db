@@ -30,11 +30,11 @@ cargo add json-mutex-db
 And get going in your code:
 
 ```rust
-use jsonmutexdb::{JsonMutexDB, DbError};
+use json_mutex_db::{JsonMutexDB, DbError};
 use serde::{Serialize, Deserialize};
 use serde_json::json;
 
-#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)] // Needed for storage/retrieval
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 struct Config {
     api_key: Option<String>,
     retries: u32,
@@ -47,16 +47,16 @@ fn main() -> Result<(), DbError> {
 
     // Get initial data (starts empty if file doesn't exist)
     let initial_val = db.get()?;
-    println!("Initial value: {}", initial_val); // Outputs: {}
+    println!("Initial value: {}", initial_val);
 
     // Update the data - replace the whole value
     let initial_config = Config { api_key: None, retries: 3 };
-    db.update(|data| {
+    db.update(move |data| {
         *data = serde_json::to_value(&initial_config).unwrap();
     })?;
 
     // Update part of the data (if it's an object)
-    db.update(|data| {
+    db.update(move |data| {
         if let Some(obj) = data.as_object_mut() {
             obj.insert("retries".to_string(), json!(5));
             obj.insert("new_feature_enabled".to_string(), json!(true));
@@ -66,30 +66,19 @@ fn main() -> Result<(), DbError> {
     // Get the current state
     let current_val = db.get()?;
     println!("Current value: {}", current_val);
-    // Example Output: {"api_key":null,"new_feature_enabled":true,"retries":5}
 
     // Try to deserialize it back
     let current_config: Config = serde_json::from_value(current_val.clone())
-                                  .expect("Failed to deserialize");
-    println!("Deserialized: {:?}", current_config);
+        .expect("Failed to deserialize");
     assert_eq!(current_config.retries, 5);
 
-
     // Save it synchronously (atomic by default)
-    println!("Saving data...");
     db.save_sync()?;
-    println!("Data saved to {}", db_path);
 
     // Cleanup the file for the example
     std::fs::remove_file(db_path).ok();
 
     Ok(())
-}
-
-// Remember to define your crate (replace with actual implementation)
-mod jsonmutexdb {
-    // Paste the full JsonMutexDB implementation here...
-    pub use crate::{JsonMutexDB, DbError}; // Assuming it's in src/lib.rs
 }
 ```
 
@@ -97,7 +86,7 @@ mod jsonmutexdb {
 
 When creating a JsonMutexDB, you have a few choices:
 
-```rust
+```rust,ignore
 pub fn new(
     path: &str,            // Path to the JSON file
     pretty: bool,          // `true` for pretty-printed JSON, `false` for compact
@@ -115,89 +104,85 @@ pub fn new(
 ### Async Updates
 
 ```rust
-use jsonmutexdb::JsonMutexDB;
+use json_mutex_db::{JsonMutexDB, DbError};
 use serde_json::json;
-use std::thread;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
-# fn main() -> Result<(), Box<dyn std::error::Error>> { // Use Box<dyn Error> for example brevity
-let db_path = "async_example.json";
-// Enable async updates, use fast compact saving
-let db = Arc::new(JsonMutexDB::new(db_path, false, true, true)?);
+fn main() -> Result<(), DbError> {
+    let db_path = "async_example.json";
+    // Enable async updates, use fast compact saving
+    let db = Arc::new(JsonMutexDB::new(db_path, false, true, true)?);
 
-let db_clone = Arc::clone(&db);
-thread::spawn(move || {
-    println!("Background thread updating...");
-    db_clone.update(|data| {
-        let obj = data.as_object_mut().unwrap();
-        obj.insert("worker_id".to_string(), json!(123));
-        obj.insert("status".to_string(), json!("running"));
-    }).expect("Failed to send update");
-    println!("Background thread update sent.");
-});
+    let db_clone = Arc::clone(&db);
+    thread::spawn(move || {
+        println!("Background thread updating...");
+        db_clone.update(|data| {
+            let obj = data.as_object_mut().unwrap();
+            obj.insert("worker_id".to_string(), json!(123));
+            obj.insert("status".to_string(), json!("running"));
+        }).expect("Failed to send update");
+        println!("Background thread update sent.");
+    });
 
-// Give the background thread a moment to process
-thread::sleep(Duration::from_millis(50));
+    // Give the background thread a moment to process
+    thread::sleep(Duration::from_millis(50));
 
-// Get the latest state (will block briefly to query background thread)
-let current_state = db.get()?;
-println!("State after async update: {}", current_state);
-assert_eq!(current_state["status"], "running");
+    // Get the latest state (will block briefly to query background thread)
+    let current_state = db.get()?;
+    println!("State after async update: {}", current_state);
+    assert_eq!(current_state["status"], "running");
 
-db.save_sync()?; // Save the state fetched from background
-println!("Async state saved.");
+    db.save_sync()?; // Save the state fetched from background
+    println!("Async state saved.");
 
-// Required: Drop the Arc to signal background thread shutdown before cleanup
-drop(db);
-thread::sleep(Duration::from_millis(50)); // Allow time for shutdown/final save
+    // Required: Drop the Arc to signal background thread shutdown before cleanup
+    drop(db);
+    thread::sleep(Duration::from_millis(50)); // Allow time for shutdown/final save
 
-std::fs::remove_file(db_path).ok();
-# Ok(())
-# }
-# mod jsonmutexdb { pub use crate::{JsonMutexDB, DbError}; } // Shim for example
-# use jsonmutexdb::{JsonMutexDB, DbError}; // Shim for example
+    std::fs::remove_file(db_path).ok();
+
+    Ok(())
+}
 ```
 
 ### Async Saving
 
 ```rust
-use jsonmutexdb::JsonMutexDB;
+use json_mutex_db::{JsonMutexDB, DbError};
 use serde_json::json;
 use std::thread;
 use std::time::Duration;
 
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
-let db_path = "async_save_example.json";
-// Sync updates, pretty printing
-let db = JsonMutexDB::new(db_path, true, false, false)?;
+fn main() -> Result<(), DbError> {
+    let db_path = "async_save_example.json";
+    // Sync updates, pretty printing
+    let db = JsonMutexDB::new(db_path, true, false, false)?;
 
-db.update(|d| *d = json!({"message": "Hello from async save!"}))?;
+    db.update(|d| *d = json!({"message": "Hello from async save!"}))?;
 
-println!("Triggering async save...");
-db.save_async()?; // Returns immediately
+    println!("Triggering async save...");
+    db.save_async()?; // Returns immediately
 
-println!("Main thread doing other work...");
-// In a real app, the main thread continues here.
-// We sleep just to allow the save to likely complete for the example.
-thread::sleep(Duration::from_millis(100));
+    println!("Main thread doing other work...");
+    thread::sleep(Duration::from_millis(100));
 
-println!("Checking file...");
-let content = std::fs::read_to_string(db_path)?;
-println!("File content:\n{}", content);
-assert!(content.contains("  \"message\":")); // Check for pretty printing
+    println!("Checking file...");
+    let content = std::fs::read_to_string(db_path)?;
+    println!("File content:\n{}", content);
+    assert!(content.contains("  \"message\":")); // Check for pretty printing
 
-std::fs::remove_file(db_path).ok();
-# Ok(())
-# }
-# mod jsonmutexdb { pub use crate::{JsonMutexDB, DbError}; } // Shim for example
-# use jsonmutexdb::{JsonMutexDB, DbError}; // Shim for example
+    std::fs::remove_file(db_path).ok();
+
+    Ok(())
+}
 ```
 
 ## Performance Notes ⚡️
 
 * Atomic Sync Saves (`save_sync`): No longer deep-clones the JSON data to avoid extra allocations and copying. Instead, holds a read lock during serialization into a thread-local buffer, reducing memory operations at the cost of blocking concurrent updates during the save.
-* Asynchronous Saves (`save_async`): Clones the entire JSON data for background saving to avoid blocking the main thread during the save operation.
+* Asynchronous Saves (`save_async`): No longer deep-clones the JSON data; holds a read lock during serialization into a thread-local buffer in the background thread, reducing memory operations at the cost of blocking concurrent updates until the save completes.
 * Serialization Buffer: The thread-local buffer is pre-allocated based on initial file size to minimize reallocations.
 * I/O: Saves serialize into a thread-local in-memory buffer and issue a single `write_all` + `flush`, drastically reducing the number of write syscalls. Atomic saves still involve writing to a temporary file and renaming.
 * Async Updates: Updates are non-blocking and queued to a background thread. Multiple rapid updates are coalesced into a single disk write, reducing redundant I/O.

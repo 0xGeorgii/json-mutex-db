@@ -20,3 +20,5 @@ target/
 
 /target
 test_db_perf.json
+test_db_async_coalesce.json
+test_db_sync_coalesce.json
