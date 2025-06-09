@@ -1,29 +1,15 @@
 #![warn(clippy::pedantic)]
 use serde_json::Value;
 use std::cell::RefCell;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Error as IoError, ErrorKind, Write};
-use std::path::Path;
-// Use std::sync::Mutex for RefUnwindSafe compatibility if needed, or stick to parking_lot otherwise
-use std::sync::Mutex; // Switched back in previous user code
+use std::fs::{self, File};
+use std::io::{Error as IoError, ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use tempfile::NamedTempFile;
 
-// Use crossbeam_channel for select! and unbounded/bounded channels
-use crossbeam_channel::{Receiver, RecvError, SendError, Sender, bounded, select, unbounded};
-
-// --- Communication types for async mode ---
-
-// Command sent from main thread to background thread
-enum BackgroundCommand {
-    // Request the current state, providing a channel to send the response back
-    GetState(Sender<Value>),
-    // Shut down the background thread gracefully
-    Shutdown,
-}
-
-// An update closure sent via a separate channel
-type UpdateTask = Box<dyn FnOnce(&mut Value) + Send>;
+use parking_lot::RwLock;
+use crossbeam_channel::{unbounded, Sender, Receiver};
 
 // Error type for operations that might fail due to background thread issues
 #[derive(Debug)]
@@ -50,21 +36,6 @@ impl From<IoError> for DbError {
     }
 }
 
-// Helper for channel send errors
-impl<T> From<SendError<T>> for DbError {
-    fn from(e: SendError<T>) -> Self {
-        DbError::Sync(format!("Failed to send command to background thread: {e}"))
-    }
-}
-
-// Helper for channel receive errors
-impl From<RecvError> for DbError {
-    fn from(e: RecvError) -> Self {
-        DbError::Sync(format!(
-            "Failed to receive response from background thread: {e}"
-        ))
-    }
-}
 
 // Thread-local buffer (optional, kept from previous version)
 thread_local! {
@@ -72,22 +43,18 @@ thread_local! {
 }
 
 pub struct JsonMutexDB {
-    // Shared state for both sync and async modes
-    path: String,
+    path: PathBuf,
+    parent_dir: PathBuf,
     pretty: bool,
     fast_serialization: bool,
-
-    // Mode-specific state
-    sync_data: Option<Mutex<Value>>, // Only used when async_updates is false
-    async_comm: Option<AsyncCommunicator>, // Only used when async_updates is true
+    inner: Arc<RwLock<Value>>,
+    save_sched: Option<Sender<()>>,
+    save_handle: Option<thread::JoinHandle<()>>,
+    /// Flag indicating if a save signal is pending in the background thread
+    save_pending: Option<Arc<AtomicBool>>,
+    dirty: AtomicBool,
 }
 
-// Holds channels and thread handle for async mode
-struct AsyncCommunicator {
-    command_tx: Sender<BackgroundCommand>,
-    update_tx: Sender<UpdateTask>,
-    update_handle: Option<thread::JoinHandle<()>>, // Option to allow taking during drop
-}
 
 // Implement UnwindSafe and RefUnwindSafe manually for JsonMutexDB
 impl std::panic::UnwindSafe for JsonMutexDB {}
@@ -121,47 +88,83 @@ impl JsonMutexDB {
             Err(err) => return Err(DbError::Io(err)),
         };
 
-        let mut sync_data = None;
-        let mut async_comm = None;
+        // Prepare file path and ensure parent directory exists
+        let path_buf = PathBuf::from(path);
+        let parent_dir = path_buf
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::new());
+        fs::create_dir_all(&parent_dir)?;
 
-        if async_updates {
-            // --- Async Mode Setup ---
-            let (command_tx, command_rx) = unbounded::<BackgroundCommand>();
-            let (update_tx, update_rx) = unbounded::<UpdateTask>();
-
-            // Clone necessary info for the background thread
-            let bg_initial_data = initial_json; // No Mutex needed here
-            let bg_path = path.to_string();
-            let bg_pretty = pretty;
-            let bg_fast_serialization = fast_serialization;
-
-            let update_handle = thread::spawn(move || {
-                background_thread_loop(
-                    bg_initial_data,
-                    &bg_path,
-                    bg_pretty,
-                    bg_fast_serialization,
-                    &command_rx,
-                    &update_rx,
-                );
+        // Pre-allocate serialization buffer based on existing file size to minimize reallocations
+        if let Ok(size) = fs::metadata(path).map(|m| m.len() as usize) {
+            SERIALIZE_BUF.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                buf.reserve(size + 1024);
             });
-
-            async_comm = Some(AsyncCommunicator {
-                command_tx,
-                update_tx,
-                update_handle: Some(update_handle),
-            });
-        } else {
-            // --- Sync Mode Setup ---
-            sync_data = Some(Mutex::new(initial_json));
         }
 
+        // Shared in-memory JSON state
+        let inner = Arc::new(RwLock::new(initial_json));
+        let mut save_sched = None;
+        let mut save_handle = None;
+        let mut save_pending = None;
+
+        if async_updates {
+            // Spawn background save thread: listens for save signals and final shutdown
+            let (tx, rx) = unbounded::<()>();
+            let inner_cl = Arc::clone(&inner);
+            let path_cl = path_buf.clone();
+            let pretty_cl = pretty;
+            let fast_cl = fast_serialization;
+            let pending_cl = Arc::new(AtomicBool::new(false));
+            let pending_thread = Arc::clone(&pending_cl);
+            // Background thread: coalesce save signals and final shutdown save
+            let handle = thread::spawn(move || {
+                for _ in rx {
+                    // Mark pending cleared before processing
+                    pending_thread.store(false, Ordering::SeqCst);
+                    let data = inner_cl.read().clone();
+                    if let Err(e) = JsonMutexDB::save_data_to_disk(
+                        &path_cl,
+                        &data,
+                        pretty_cl,
+                        fast_cl,
+                        true,
+                    ) {
+                        eprintln!("Async background save failed: {e:?}");
+                    }
+                }
+                // Final non-atomic save on shutdown
+                let data = inner_cl.read().clone();
+                if let Err(e) = JsonMutexDB::save_data_to_disk(
+                    &path_cl,
+                    &data,
+                    pretty_cl,
+                    fast_cl,
+                    false,
+                ) {
+                    eprintln!("Error during final background save: {e:?}");
+                }
+            });
+            save_sched = Some(tx);
+            save_handle = Some(handle);
+            save_pending = Some(pending_cl);
+        }
+
+        // Track whether state has been modified since last save
+        let dirty = AtomicBool::new(false);
+
         Ok(JsonMutexDB {
-            path: path.to_string(),
+            path: path_buf,
+            parent_dir,
             pretty,
             fast_serialization,
-            sync_data,
-            async_comm,
+            inner,
+            save_sched,
+            save_handle,
+            save_pending,
+            dirty,
         })
     }
 
@@ -175,31 +178,9 @@ impl JsonMutexDB {
     /// - The mutex is poisoned in sync mode.
     /// - The database is in an invalid state (neither sync nor async mode).
     pub fn get(&self) -> Result<Value, DbError> {
-        if let Some(comm) = &self.async_comm {
-            // --- Async Mode: Request state from background ---
-            // Create a temporary channel for the response
-            let (response_tx, response_rx) = bounded(1); // Size 1 for one-shot behavior
-            comm.command_tx
-                .send(BackgroundCommand::GetState(response_tx))?;
-            // Block waiting for the response
-            let value = response_rx.recv()?;
-            Ok(value)
-        } else if let Some(mutex) = &self.sync_data {
-            // --- Sync Mode: Lock local mutex ---
-            let guard = mutex
-                .lock()
-                .map_err(|_| DbError::Sync("Mutex poisoned".to_string()))?;
-            Ok(guard.clone())
-            // Handle potential poisoning if using std::sync::Mutex
-            // match mutex.lock() {
-            //     Ok(guard) => Ok(guard.clone()),
-            //     Err(poisoned) => Ok(poisoned.into_inner().clone()), // Or return DbError::Sync
-            // }
-        } else {
-            Err(DbError::Sync(
-                "DB is in an invalid state (neither sync nor async)".to_string(),
-            ))
-        }
+        // Always read from in-memory state
+        let guard = self.inner.read();
+        Ok((*guard).clone())
     }
 
     /// Updates the JSON data.
@@ -220,30 +201,23 @@ impl JsonMutexDB {
     where
         F: FnOnce(&mut Value) + Send + 'static,
     {
-        if let Some(comm) = &self.async_comm {
-            // --- Async Mode: Send update task ---
-            comm.update_tx.send(Box::new(update_fn))?;
-            Ok(())
-        } else if let Some(mutex) = &self.sync_data {
-            // --- Sync Mode: Lock and apply ---
-            let mut guard = mutex
-                .lock()
-                .map_err(|_| DbError::Sync("Mutex poisoned".to_string()))?;
-            update_fn(&mut guard);
-            Ok(())
-            // Handle potential poisoning
-            // match mutex.lock() {
-            //     Ok(mut guard) => {
-            //         update_fn(&mut guard);
-            //         Ok(())
-            //     }
-            //     Err(_) => Err(DbError::Sync("Mutex poisoned during update".to_string())),
-            // }
-        } else {
-            Err(DbError::Sync(
-                "DB is in an invalid state (neither sync nor async)".to_string(),
-            ))
+        // Apply update immediately to in-memory state
+        {
+            let mut guard = self.inner.write();
+            update_fn(&mut *guard);
         }
+        self.dirty.store(true, Ordering::Release);
+        // Signal background save thread if enabled, coalescing multiple signals
+        if let (Some(pending), Some(tx)) = (&self.save_pending, &self.save_sched) {
+            // Only send if no save is already pending (compare-and-set)
+            if pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let _ = tx.send(());
+            }
+        }
+        Ok(())
     }
 
     /// Synchronously saves the current JSON data to disk atomically.
@@ -255,17 +229,21 @@ impl JsonMutexDB {
     /// - The current state cannot be fetched (e.g., due to background thread issues in async mode).
     /// - There are file I/O errors during the save operation.
     pub fn save_sync(&self) -> Result<(), DbError> {
-        // 1. Get the current state (fetches from background if async)
-        let data_to_save = self.get()?;
-
-        // 2. Use the optimized internal save function with atomic=true
-        Self::save_data_to_disk(
+        // Skip save if no changes since last save
+        if !self.dirty.swap(false, Ordering::Acquire) {
+            return Ok(());
+        }
+        // Perform atomic save without deep-cloning: hold read lock during serialization
+        let guard = self.inner.read();
+        let result = Self::save_data_to_disk(
             &self.path,
-            &data_to_save,
+            &*guard,
             self.pretty,
             self.fast_serialization,
-            true, // Atomic save
-        )
+            true,
+        );
+        drop(guard);
+        result
     }
 
     /// Asynchronously saves the current JSON data atomically.
@@ -280,25 +258,25 @@ impl JsonMutexDB {
     /// - The current state cannot be fetched (e.g., due to background thread issues in async mode).
     /// - There are file I/O errors during the save operation.
     pub fn save_async(&self) -> Result<(), DbError> {
-        // 1. Get the current state (fetches from background if async)
-        // This block ensures we get the state *before* spawning the thread.
-        let data_clone = self.get()?;
-
-        // Clone necessary data for the background thread
+        // Skip save if no changes since last save
+        if !self.dirty.swap(false, Ordering::Acquire) {
+            return Ok(());
+        }
+        // Spawn a thread to perform the atomic save asynchronously without deep-cloning the data
+        let inner_clone = Arc::clone(&self.inner);
         let path_clone = self.path.clone();
         let pretty_clone = self.pretty;
         let fast_serial_clone = self.fast_serialization;
 
-        // 2. Spawn a thread to perform the save using the optimized helper
         thread::spawn(move || {
+            let guard = inner_clone.read();
             if let Err(e) = Self::save_data_to_disk(
                 &path_clone,
-                &data_clone,
+                &*guard,
                 pretty_clone,
                 fast_serial_clone,
-                true, // Perform atomic save in background thread
+                true,
             ) {
-                // Consider more robust error reporting than just stderr
                 eprintln!("Async save failed: {e:?}");
             }
         });
@@ -307,158 +285,64 @@ impl JsonMutexDB {
 
     // --- Internal helper remains largely the same ---
     fn save_data_to_disk(
-        path_str: &str,
+        path: &Path,
         data_to_save: &Value,
         pretty: bool,
         fast_serialization: bool,
         atomic: bool,
     ) -> Result<(), DbError> {
         // Changed return type to DbError
-        let path = Path::new(path_str);
         let final_path = path.to_path_buf();
 
-        let write_logic = |writer: Box<dyn Write>| -> Result<(), DbError> {
-            let mut buffered_writer = BufWriter::new(writer);
+        // Serialize and write using thread-local buffer for fewer allocations and write calls
+        SERIALIZE_BUF.with(|cell| -> Result<(), DbError> {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
             if pretty {
-                serde_json::to_writer_pretty(&mut buffered_writer, data_to_save)
+                serde_json::to_writer_pretty(&mut *buf, data_to_save)
                     .map_err(|e| DbError::Io(IoError::other(e.to_string())))?;
             } else if fast_serialization {
-                simd_json::to_writer(&mut buffered_writer, data_to_save)
+                simd_json::to_writer(&mut *buf, data_to_save)
                     .map_err(|e| DbError::Io(IoError::other(format!("{e:?}"))))?;
             } else {
-                serde_json::to_writer(&mut buffered_writer, data_to_save)
+                serde_json::to_writer(&mut *buf, data_to_save)
                     .map_err(|e| DbError::Io(IoError::other(e.to_string())))?;
             }
-            buffered_writer.flush()?; // Ensure buffer is flushed
+            if atomic {
+                let parent_dir = path.parent().ok_or_else(|| {
+                    DbError::Io(IoError::new(
+                        ErrorKind::InvalidInput,
+                        "Invalid path: cannot determine parent directory",
+                    ))
+                })?;
+                let mut temp_file = NamedTempFile::new_in(parent_dir)?;
+                temp_file.write_all(&buf)?;
+                temp_file.flush()?;
+                temp_file.persist(&final_path).map_err(|e| {
+                    DbError::Io(IoError::other(format!(
+                        "Failed to atomically rename temp file: {}",
+                        e.error
+                    )))
+                })?;
+            } else {
+                let mut file = File::create(path)?;
+                file.write_all(&buf)?;
+                file.flush()?;
+            }
             Ok(())
-        };
-
-        if atomic {
-            let parent_dir = path.parent().ok_or_else(|| {
-                DbError::Io(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Invalid path: cannot determine parent directory",
-                ))
-            })?;
-            fs::create_dir_all(parent_dir)?; // Ensure parent dir exists
-
-            // Create temp file
-            let temp_file = NamedTempFile::new_in(parent_dir)?;
-            let temp_path = temp_file.path().to_path_buf(); // Keep path
-
-            // Write to temp file (using explicit file handle for Box<dyn Write>)
-            let file = OpenOptions::new().write(true).open(&temp_path)?;
-            write_logic(Box::new(file))?; // Write happens here
-
-            // Persist atomically (consumes temp_file)
-            temp_file.persist(&final_path).map_err(|e| {
-                DbError::Io(IoError::other(format!(
-                    "Failed to atomically rename temp file: {}",
-                    e.error
-                )))
-            })?;
-        } else {
-            // Non-atomic: Create/truncate target file directly
-            let file = File::create(path)?;
-            write_logic(Box::new(file))?;
-        }
-
+        })?;
         Ok(())
     }
 }
 
-// --- Background Thread Logic ---
-fn background_thread_loop(
-    mut local_data: Value,
-    path: &str,
-    pretty: bool,
-    fast_serialization: bool,
-    command_rx: &Receiver<BackgroundCommand>,
-    update_rx: &Receiver<UpdateTask>,
-) {
-    println!("Background thread started.");
-    loop {
-        select! {
-            // Received an update task
-            recv(update_rx) -> msg => {
-                if let Ok(update_fn) = msg {
-                    // Apply the update to the local state
-                    update_fn(&mut local_data);
-                    // Optional: log update application
-                } else {
-                    // Update channel closed, probably shutting down.
-                    println!("Update channel closed.");
-                    break; // Exit loop
-                }
-            },
-
-            // Received a command (GetState or Shutdown)
-            recv(command_rx) -> msg => {
-                match msg {
-                    Ok(BackgroundCommand::GetState(response_tx)) => {
-                        // Clone current state and send it back
-                        let _ = response_tx.send(local_data.clone()); // Ignore error if main thread hung up
-                    }
-                     Ok(BackgroundCommand::Shutdown) => {
-                         println!("Received Shutdown command.");
-                         break; // Exit loop
-                     }
-                    Err(_) => {
-                        // Command channel closed, main thread likely dropped.
-                        println!("Command channel closed.");
-                        break; // Exit loop
-                    }
-                }
-            }
-        }
-    }
-
-    // --- Shutdown sequence ---
-    println!("Background thread shutting down. Performing final save...");
-    // Perform a final non-atomic save of the last known state
-    if let Err(e) = JsonMutexDB::save_data_to_disk(
-        path,
-        &local_data,
-        pretty,
-        fast_serialization,
-        false, // Non-atomic during this final shutdown save
-    ) {
-        eprintln!("Error during final background save: {e:?}");
-    }
-    println!("Background thread finished.");
-}
-
+// Shutdown background save thread on drop, ensuring final flush
 impl Drop for JsonMutexDB {
     fn drop(&mut self) {
-        if let Some(mut comm) = self.async_comm.take() {
-            println!("Dropping JsonMutexDB (async)...");
-            // 1. Signal background thread to shut down (optional, closing channels might suffice)
-            let _ = comm.command_tx.send(BackgroundCommand::Shutdown);
-
-            // 2. Drop senders - this will cause receivers in background to error/terminate select! loop
-            drop(comm.command_tx);
-            drop(comm.update_tx);
-
-            // 3. Wait for the background thread to finish
-            if let Some(handle) = comm.update_handle.take() {
-                match handle.join() {
-                    Ok(()) => println!("Background thread joined cleanly."),
-                    Err(e) => eprintln!("Background thread panicked: {e:?}"),
-                }
+        if let Some(tx) = self.save_sched.take() {
+            drop(tx);
+            if let Some(handle) = self.save_handle.take() {
+                let _ = handle.join();
             }
-        } else {
-            println!("Dropping JsonMutexDB (sync)...");
-            // Optional: Save synchronously if in sync mode and desired
-            // if let Some(mutex) = &self.sync_data {
-            //     match mutex.lock() {
-            //         Ok(guard) => {
-            //             if let Err(e) = Self::save_data_to_disk(&self.path, &guard, self.pretty, self.fast_serialization, true) {
-            //                  eprintln!("Error during final sync save on drop: {:?}", e);
-            //             }
-            //         },
-            //         Err(_) => eprintln!("Mutex poisoned during drop, could not save."),
-            //     }
-            // }
         }
     }
 }
@@ -468,9 +352,61 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+    use std::io::{BufWriter, Write};
     use std::sync::Arc;
     use std::thread;
-    use std::time::{Duration, Instant}; // Added Duration
+    use std::time::{Duration, Instant};
+
+    struct WriteCounter {
+        calls: usize,
+        bytes: usize,
+    }
+    impl WriteCounter {
+        fn new() -> Self {
+            Self { calls: 0, bytes: 0 }
+        }
+        fn calls(&self) -> usize {
+            self.calls
+        }
+        fn bytes(&self) -> usize {
+            self.bytes
+        }
+    }
+    impl Write for WriteCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let len = buf.len();
+            self.calls += 1;
+            self.bytes += len;
+            Ok(len)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn write_json_raw<W: Write>(
+        writer: &mut W,
+        data: &Value,
+        pretty: bool,
+        fast: bool,
+    ) -> std::io::Result<()> {
+        // Serialize into thread-local buffer and write in one shot for fewer write calls
+        SERIALIZE_BUF.with(|cell| -> std::io::Result<()> {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            if pretty {
+                serde_json::to_writer_pretty(&mut *buf, data)?;
+            } else if fast {
+                simd_json::to_writer(&mut *buf, data)?;
+            } else {
+                serde_json::to_writer(&mut *buf, data)?;
+            }
+            writer.write_all(&buf)?;
+            writer.flush()?;
+            Ok(())
+        })?;
+        Ok(())
+    }
 
     // Helper to remove test file quietly
     fn cleanup_file(path: &str) {
@@ -983,5 +919,121 @@ mod tests {
         assert_eq!(final_data_unwrapped["writer1_key49"], 49);
 
         cleanup_file(tmp_path);
+    }
+
+    /// Naive JSON write helper (before optimization)
+    fn write_json_orig<W: Write>(writer: &mut W, data: &Value, pretty: bool, fast: bool) -> std::io::Result<()> {
+        if pretty {
+            serde_json::to_writer_pretty(writer.by_ref(), data)?;
+        } else if fast {
+            simd_json::to_writer(writer.by_ref(), data)?;
+        } else {
+            serde_json::to_writer(writer.by_ref(), data)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_call_count_compact_fast() {
+        let mut data_map = serde_json::Map::new();
+        for i in 0..500 {
+            data_map.insert(format!("key{}", i), json!(i));
+        }
+        let v = Value::Object(data_map);
+        let mut cnt_std = WriteCounter::new();
+        write_json_raw(&mut cnt_std, &v, false, false).unwrap();
+        let std_calls = cnt_std.calls();
+        let mut cnt_fast = WriteCounter::new();
+        write_json_raw(&mut cnt_fast, &v, false, true).unwrap();
+        let fast_calls = cnt_fast.calls();
+        assert!(
+            fast_calls <= std_calls,
+            "fast serialization should use no more write calls: fast={} std={}",
+            fast_calls,
+            std_calls
+        );
+    }
+
+    #[test]
+    fn test_write_call_count_pretty_vs_compact() {
+        let mut data_map = serde_json::Map::new();
+        data_map.insert("a".to_string(), json!(1));
+        data_map.insert("b".to_string(), json!(2));
+        let v = Value::Object(data_map);
+        let mut cnt_compact = WriteCounter::new();
+        write_json_raw(&mut cnt_compact, &v, false, false).unwrap();
+        let compact_calls = cnt_compact.calls();
+        let mut cnt_pretty = WriteCounter::new();
+        write_json_raw(&mut cnt_pretty, &v, true, false).unwrap();
+        let pretty_calls = cnt_pretty.calls();
+        assert!(
+            pretty_calls >= compact_calls,
+            "pretty printing should use at least as many write calls: pretty={} compact={}",
+            pretty_calls,
+            compact_calls
+        );
+    }
+
+    #[test]
+    fn test_optimized_vs_naive_write_calls_standard() {
+        let mut data_map = serde_json::Map::new();
+        for i in 0..1000 {
+            data_map.insert(format!("key{}", i), json!(i));
+        }
+        let v = Value::Object(data_map);
+        let mut cnt_old = WriteCounter::new();
+        write_json_orig(&mut cnt_old, &v, false, false).unwrap();
+        let old_calls = cnt_old.calls();
+        let mut cnt_new = WriteCounter::new();
+        write_json_raw(&mut cnt_new, &v, false, false).unwrap();
+        let new_calls = cnt_new.calls();
+        assert!(
+            new_calls < old_calls,
+            "optimized write_json_raw should use fewer writes than naive: {} < {}",
+            new_calls,
+            old_calls
+        );
+    }
+
+    #[test]
+    fn test_optimized_vs_naive_write_calls_fast() {
+        let mut data_map = serde_json::Map::new();
+        for i in 0..1000 {
+            data_map.insert(format!("key{}", i), json!(i));
+        }
+        let v = Value::Object(data_map);
+        let mut cnt_old = WriteCounter::new();
+        write_json_orig(&mut cnt_old, &v, false, true).unwrap();
+        let old_calls = cnt_old.calls();
+        let mut cnt_new = WriteCounter::new();
+        write_json_raw(&mut cnt_new, &v, false, true).unwrap();
+        let new_calls = cnt_new.calls();
+        assert!(
+            new_calls < old_calls,
+            "optimized write_json_raw should use fewer writes than naive fast: {} < {}",
+            new_calls,
+            old_calls
+        );
+    }
+
+    #[test]
+    fn test_write_json_pretty_vs_compact() {
+        let mut data_map = serde_json::Map::new();
+        data_map.insert("a".to_string(), json!(1));
+        data_map.insert("b".to_string(), json!(2));
+        let v = Value::Object(data_map);
+        let mut cnt_compact = WriteCounter::new();
+        write_json_raw(&mut cnt_compact, &v, false, false).unwrap();
+        let compact_calls = cnt_compact.calls();
+        let mut cnt_pretty = WriteCounter::new();
+        write_json_raw(&mut cnt_pretty, &v, true, false).unwrap();
+        let pretty_calls = cnt_pretty.calls();
+        assert!(
+            pretty_calls >= compact_calls,
+            "pretty printing should use at least as many write calls: pretty={} compact={}",
+            pretty_calls,
+            compact_calls
+        );
     }
 }

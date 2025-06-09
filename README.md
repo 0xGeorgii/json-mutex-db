@@ -196,9 +196,11 @@ std::fs::remove_file(db_path).ok();
 
 ## Performance Notes ⚡️
 
-* Serialization: `simd-json` (fast_serialization: true) can significantly speed up saving compact JSON. Pretty printing will always use `serde_json`.
-* I/O: Saves use `std::io::BufWriter` to minimize system calls. Atomic saves add the overhead of writing to a temporary file and renaming. `save_async` offloads serialization and I/O but involves thread spawning and fetching state (if async updates are on).
-* Async Updates: Enabling async_updates reduces blocking on update calls but adds overhead for channel communication on get and save_sync to maintain consistency. Choose based on whether update latency or get/save latency is more critical.
+* Atomic Sync Saves (`save_sync`): No longer deep-clones the JSON data to avoid extra allocations and copying. Instead, holds a read lock during serialization into a thread-local buffer, reducing memory operations at the cost of blocking concurrent updates during the save.
+* Asynchronous Saves (`save_async`): Clones the entire JSON data for background saving to avoid blocking the main thread during the save operation.
+* Serialization Buffer: The thread-local buffer is pre-allocated based on initial file size to minimize reallocations.
+* I/O: Saves serialize into a thread-local in-memory buffer and issue a single `write_all` + `flush`, drastically reducing the number of write syscalls. Atomic saves still involve writing to a temporary file and renaming.
+* Async Updates: Updates are non-blocking and queued to a background thread. Multiple rapid updates are coalesced into a single disk write, reducing redundant I/O.
 
 ## Error Handling ⚠️
 
