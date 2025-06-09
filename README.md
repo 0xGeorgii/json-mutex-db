@@ -1,5 +1,6 @@
 [![Build](https://github.com/Inferara/inf-wasm-tools/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/Inferara/inf-wasm-tools/actions/workflows/build.yml)
 ![Crates.io Version](https://img.shields.io/crates/v/json-mutex-db?label=json-mutex-db)
+![Crates.io Total Downloads](https://img.shields.io/crates/d/json-mutex-db)
 
 # JsonMutexDB 💾
 
@@ -25,6 +26,12 @@ Ever found yourself needing a *really* simple way to persist some state in a Rus
 
 ```bash
 cargo add json-mutex-db
+```
+
+or add the following line to your `Cargo.toml`:
+
+```toml
+json-mutex-db = "0.0.2"
 ```
 
 And get going in your code:
