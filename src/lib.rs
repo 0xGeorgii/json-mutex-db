@@ -72,6 +72,7 @@ impl JsonMutexDB {
     ///
     /// This function will return an error if the specified file cannot be read,
     /// if the JSON data is invalid, or if there are issues with file I/O operations.
+    #[allow(clippy::cast_precision_loss)]
     pub fn new(
         path: &str,
         pretty: bool,
